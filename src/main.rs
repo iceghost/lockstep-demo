@@ -18,8 +18,8 @@ fn main() -> Result<()> {
     std::thread::scope(|s| -> Result<()> {
         // change the player to Trudy to see the effect
         //                                        👇
-        let a = s.spawn(|| Player::new(PlayerName::Alice, atx, arx).play(Hand::Paper));
-        let b = s.spawn(|| Player::new(PlayerName::Bob, btx, brx).play(Hand::Scissor));
+        let a = s.spawn(|| Player::new(PlayerName::Alice, atx, arx).play(Hand::Rock));
+        let b = s.spawn(|| Player::new(PlayerName::Trudy, btx, brx).play(Hand::Scissor));
         a.join().unwrap()?;
         b.join().unwrap()?;
         Ok(())
@@ -140,7 +140,11 @@ impl Player {
 
     #[tracing::instrument(skip(hand, op_hand))]
     fn change_hand(&mut self, hand: &mut Hand, op_hand: Hand) {
-        *hand = op_hand.opposite();
-        warn!("change hand to {hand}");
+        if *hand != op_hand.opposite() {
+            *hand = op_hand.opposite();
+            warn!("change hand to {hand}");
+        } else {
+            warn!("i win anyway, no need to change hand");
+        }
     }
 }
