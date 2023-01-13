@@ -1,8 +1,10 @@
-use rand::RngCore;
-use sha2::Digest;
-use std::{cmp::Ordering, fmt::Display, hash::Hash, sync::mpsc};
+mod hand;
+mod message;
+
+use hand::Hand;
+use message::{Commit, Message, Salt};
+use std::{cmp::Ordering, sync::mpsc};
 use tracing::{error, info, warn};
-use Message::*;
 
 type Result<T> = anyhow::Result<T>;
 
@@ -13,184 +15,132 @@ fn main() -> Result<()> {
     let (atx, brx) = mpsc::channel();
     let (btx, arx) = mpsc::channel();
 
-    std::thread::scope(|s| {
-        let a = s.spawn(|| alice(atx, arx).unwrap());
-        let b = s.spawn(|| bob(btx, brx).unwrap());
-        a.join().unwrap();
-        b.join().unwrap();
-    });
+    std::thread::scope(|s| -> Result<()> {
+        // change the player to Trudy to see the effect
+        //                                        👇
+        let a = s.spawn(|| Player::new(PlayerName::Alice, atx, arx).play(Hand::Paper));
+        let b = s.spawn(|| Player::new(PlayerName::Bob, btx, brx).play(Hand::Scissor));
+        a.join().unwrap()?;
+        b.join().unwrap()?;
+        Ok(())
+    })
+    .unwrap();
 
     Ok(())
 }
 
-#[derive(Hash, Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-enum Hand {
-    Rock = 0,
-    Paper = 1,
-    Scissor = 2,
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PlayerName {
+    Alice,
+    Bob,
+    Trudy,
 }
 
-impl Hand {
-    fn opposite(self) -> Self {
-        [Hand::Rock, Hand::Paper, Hand::Scissor][(self as usize + 1) % 3]
-    }
+struct Player {
+    name: PlayerName,
+    tx: mpsc::Sender<Message>,
+    rx: mpsc::Receiver<Message>,
 }
 
-impl Display for Hand {
+impl std::fmt::Debug for Player {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Hand::Rock => write!(f, "rock"),
-            Hand::Paper => write!(f, "paper"),
-            Hand::Scissor => write!(f, "scissor"),
+        write!(f, "{:?}", self.name)
+    }
+}
+
+impl Player {
+    fn new(name: PlayerName, tx: mpsc::Sender<Message>, rx: mpsc::Receiver<Message>) -> Self {
+        Self { name, tx, rx }
+    }
+
+    fn play(&mut self, mut hand: Hand) -> Result<()> {
+        // MATCH START
+
+        // 1. come up with a hand and send the opponent the commit
+        let (commit, salt) = self.commit(hand);
+        self.send_commit(commit)?;
+
+        // 2a1. wait for the opponent's commit
+        let op_commit = self.wait_commit()?;
+
+        if self.name == PlayerName::Trudy {
+            // 2a2. wait for opponent's hand
+            let (op_hand, _) = self.wait_hand()?;
+
+            // 2a3. change into winning hand
+            self.change_hand(&mut hand, op_hand);
+
+            // 2a4. send hand
+            self.throw_hand(hand, salt)?;
+
+            return Ok(());
         }
-    }
-}
 
-impl PartialOrd for Hand {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+        // 2a2. throw hand to opponent
+        self.throw_hand(hand, salt)?;
 
-impl Ord for Hand {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self == other {
-            Ordering::Equal
-        } else if *self == other.opposite() {
-            Ordering::Greater
-        } else {
-            Ordering::Less
+        // 2b1. wait for opponent hand (parallel to 2a)
+        let (op_hand, op_salt) = self.wait_hand()?;
+
+        // 2b2. verify opponent integrity
+        if !Message::verify(op_hand, op_salt, op_commit) {
+            error!("cheater detected!");
+            return Ok(());
         }
-    }
-}
 
-type Salt = [u8; 16];
-type Commit = [u8; 32];
+        // 3. check match result
+        self.check_result(hand, op_hand);
 
-#[derive(PartialEq, Eq, Debug)]
-enum Message {
-    Commit(Commit),
-    Hand(Hand, Salt),
-}
-
-impl Message {
-    fn commit(hand: Hand) -> (Commit, Salt) {
-        let mut salt = Salt::default();
-        rand::thread_rng().fill_bytes(&mut salt);
-        (Self::commit_with_salt(hand, salt), salt)
+        Ok(())
     }
 
-    fn commit_with_salt(hand: Hand, salt: Salt) -> Commit {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&[hand as u8]);
-        hasher.update(&salt);
-        hasher.finalize().into()
+    #[tracing::instrument]
+    fn commit(&mut self, hand: Hand) -> (Commit, Salt) {
+        let (commit, salt) = Message::commit(hand);
+        info!("done");
+        (commit, salt)
     }
 
-    fn verify(hand: Hand, salt: Salt, commit: Commit) -> bool {
-        commit == Self::commit_with_salt(hand, salt)
+    #[tracing::instrument(skip(commit))]
+    fn send_commit(&mut self, commit: Commit) -> Result<()> {
+        self.tx.send(Message::Commit(commit))?;
+        info!("done");
+        Ok(())
     }
-}
 
-#[tracing::instrument(skip(tx, rx))]
-fn alice(tx: mpsc::Sender<Message>, rx: mpsc::Receiver<Message>) -> Result<()> {
-    // MATCH START
+    #[tracing::instrument]
+    fn wait_commit(&mut self) -> Result<Commit> {
+        let Message::Commit(op_commit) = self.rx.recv()? else { panic!("expected commit") };
+        info!("got commit");
+        Ok(op_commit)
+    }
 
-    let hand = Hand::Paper;
+    #[tracing::instrument(skip(salt))]
+    fn throw_hand(&mut self, hand: Hand, salt: Salt) -> Result<()> {
+        self.tx.send(Message::Hand(hand, salt))?;
+        info!("done");
+        Ok(())
+    }
 
-    let (commit, salt) = Message::commit(hand);
-    tx.send(Message::Commit(commit))?;
-    info!("sent commit ({hand})");
+    #[tracing::instrument]
+    fn wait_hand(&mut self) -> Result<(Hand, Salt)> {
+        let Message::Hand(op_hand, op_salt) = self.rx.recv()? else { panic!("expected hand") };
+        info!("got {op_hand}");
+        Ok((op_hand, op_salt))
+    }
 
-    let Commit(op_commit) = rx.recv()? else { panic!("expected commit") };
-    info!("receive commit");
-
-    let Hand(op_hand, op_salt) = rx.recv()? else { panic!("expected hand") };
-    info!("got {op_hand}");
-
-    tx.send(Hand(hand, salt))?;
-    info!("throw {hand}");
-
-    if !Message::verify(op_hand, op_salt, op_commit) {
-        error!("cheater detected!");
-    } else {
+    #[tracing::instrument]
+    fn check_result(&mut self, hand: Hand, op_hand: Hand) {
         match hand.cmp(&op_hand) {
-            Ordering::Less => info!("i lose..."),
+            Ordering::Less => info!("i lost..."),
             Ordering::Equal => info!("a draw, i see"),
-            Ordering::Greater => info!("i win!"),
+            Ordering::Greater => info!("i won!"),
         }
     }
 
-    // channel is closed
-    drop(tx);
-    assert!(rx.recv().is_err());
-    Ok(())
-}
-
-#[tracing::instrument(skip(tx, rx))]
-fn bob(tx: mpsc::Sender<Message>, rx: mpsc::Receiver<Message>) -> Result<()> {
-    // MATCH START
-
-    let hand = Hand::Scissor;
-
-    let (commit, salt) = Message::commit(hand);
-    tx.send(Message::Commit(commit))?;
-    info!("sent commit ({hand})");
-
-    let Commit(op_commit) = rx.recv()? else { panic!("expected commit") };
-    info!("receive commit");
-
-    tx.send(Hand(hand, salt))?;
-    info!("throw {hand}");
-
-    let Hand(op_hand, op_salt) = rx.recv()? else { panic!("expected hand") };
-    info!("got {op_hand}");
-
-    if !Message::verify(op_hand, op_salt, op_commit) {
-        error!("cheater detected!");
-    } else {
-        match hand.cmp(&op_hand) {
-            Ordering::Less => info!("i lose..."),
-            Ordering::Equal => info!("a draw, i see"),
-            Ordering::Greater => info!("i win!"),
-        }
+    #[tracing::instrument(skip(hand, op_hand))]
+    fn change_hand(&mut self, hand: &mut Hand, op_hand: Hand) {
+        *hand = op_hand.opposite();
+        warn!("change hand to {hand}");
     }
-
-    // channel is closed
-    drop(tx);
-    assert!(rx.recv().is_err());
-    Ok(())
-}
-
-#[tracing::instrument(skip(tx, rx))]
-fn trudy(tx: mpsc::Sender<Message>, rx: mpsc::Receiver<Message>) -> Result<()> {
-    // MATCH START
-
-    let mut hand = Hand::Paper;
-
-    let (commit, salt) = Message::commit(hand);
-    tx.send(Message::Commit(commit))?;
-    info!("sent commit ({hand})");
-
-    let Commit(op_commit) = rx.recv()? else { panic!("expected commit") };
-    info!("receive commit");
-
-    let Hand(op_hand, op_salt) = rx.recv()? else { panic!("expected hand") };
-    info!("got {op_hand}");
-
-    hand = op_hand.opposite();
-    warn!("change hand to {hand}");
-
-    tx.send(Hand(hand, salt))?;
-    info!("throw {hand}");
-
-    if !Message::verify(op_hand, op_salt, op_commit) {
-        error!("cheater detected!");
-    }
-
-    // channel is closed
-    drop(tx);
-    assert!(rx.recv().is_err());
-    Ok(())
 }
